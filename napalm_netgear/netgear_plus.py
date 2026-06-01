@@ -730,6 +730,13 @@ class NetgearPlusDriver(SwitchDriver):
             "set_interface() is not supported for Netgear Plus switches."
         )
 
+    # ── SNMP / Health ──────────────────────────────────────────────────────────
+
+    def get_snmp_config(self):
+        """SNMP is not accessible via the HTTP API used by this driver.
+        Returns None to indicate SNMP health monitoring is not supported."""
+        return None
+
     def get_device_warnings(self) -> list:
         """Check for available firmware updates and return a warning if the
         device is not running the latest known firmware.

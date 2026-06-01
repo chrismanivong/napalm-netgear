@@ -1421,3 +1421,79 @@ class NetgearSmartDriver(SwitchDriver):
         for cmd in commands:
             result[cmd] = self._send_command(cmd)
         return result
+
+    # ── SNMP / Health ──────────────────────────────────────────────────────────
+
+    def get_device_warnings(self) -> list:
+        """Return device warnings. SNMP detection handled by poll task."""
+        return []
+
+    def get_snmp_config(self):
+        """Return SNMP config if a community is configured on the switch."""
+        try:
+            from napalm_device_types.models import SNMPConfigDict
+        except ImportError:
+            return None
+
+        try:
+            out = self._send_command("show snmp")
+        except Exception:
+            return None
+
+        if not out:
+            return None
+
+        community = None
+        in_comm = False
+        for line in out.splitlines():
+            line_s = line.strip()
+            if "Community" in line_s and ("Name" in line_s or "String" in line_s):
+                in_comm = True
+                continue
+            if not in_comm or not line_s or re.match(r"^-{3,}", line_s):
+                continue
+            parts = line_s.split()
+            if parts:
+                access = " ".join(parts[1:3]).lower() if len(parts) >= 2 else ""
+                if "write" not in access:  # prefer read-only
+                    community = parts[0]
+                    break
+                elif community is None:
+                    community = parts[0]
+
+        if not community:
+            return None
+
+        return SNMPConfigDict(running=True, community=community, port=161, version="2c")
+
+    def run_device_action(self, action: str) -> Dict:
+        """Execute a named action on the switch."""
+        if action == "fix_snmp":
+            return self._action_fix_snmp()
+        raise NotImplementedError(f"Unknown action: {action!r}")
+
+    def _action_fix_snmp(self) -> Dict:
+        """Enable SNMP with community 'public' (read-only) on the Netgear Smart switch."""
+        lines: list = []
+
+        self._enter_config_mode()
+        # Netgear Smart CLI: snmp-server community <name> ro
+        self._send_command("snmp-server community public ro")
+        lines.append("[config] SNMP community 'public' (read-only) configured.")
+        self._exit_config_mode()
+        self._save_config()
+        lines.append("[config] Configuration saved.")
+
+        # Verify
+        try:
+            out = self._send_command("show snmp")
+            success = "public" in out
+        except Exception:
+            success = False
+            out = ""
+        if success:
+            lines.append("[ok] SNMP active with community 'public'.")
+        else:
+            lines.append(f"[warn] Verification failed: {out[:100]}")
+
+        return {"success": success, "output": "\n".join(lines)}
