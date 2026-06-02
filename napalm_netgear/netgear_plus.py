@@ -146,6 +146,7 @@ class NetgearPlusDriver(SwitchDriver):
     """HTTP-based NAPALM driver for Netgear Plus Smart Managed switches."""
 
     VENDOR = "Netgear"
+    SNMP_CAPABLE = False  # HTTP-only device — no SNMP daemon
 
     def __init__(
         self,
