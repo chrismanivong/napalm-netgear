@@ -1496,4 +1496,67 @@ class NetgearSmartDriver(SwitchDriver):
         else:
             lines.append(f"[warn] Verification failed: {out[:100]}")
 
+    # ------------------------------------------------------------------
+    # Health metrics (SNMP)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def get_health_metrics(cls, snmp_get, snmp_walk) -> dict:
+        import asyncio
+        import re
+        from napalm_device_types._ucd_metrics import build_if_metrics, ticks_to_seconds
+
+        _OID_SNMP_UPTIME   = "1.3.6.1.2.1.1.3.0"
+        _NETGEAR_MEM_FREE  = "1.3.6.1.4.1.4526.100.1.1.4.1.0"
+        _NETGEAR_MEM_TOTAL = "1.3.6.1.4.1.4526.100.1.1.4.2.0"
+        _NETGEAR_CPU_STR   = "1.3.6.1.4.1.4526.100.1.1.4.9.0"
+        _OID_IF_DESCR      = "1.3.6.1.2.1.2.2.1.2"
+        _OID_IF_SPEED      = "1.3.6.1.2.1.2.2.1.5"
+        _OID_IF_IN_OCT     = "1.3.6.1.2.1.2.2.1.10"
+        _OID_IF_OUT_OCT    = "1.3.6.1.2.1.2.2.1.16"
+        _OID_IF_IN_ERR     = "1.3.6.1.2.1.2.2.1.14"
+        _OID_IF_OUT_ERR    = "1.3.6.1.2.1.2.2.1.20"
+
+        (uptime_raw, free_s, total_s, cpu_s,
+         descr, speed, in_oct, out_oct, in_err, out_err) = await asyncio.gather(
+            snmp_get(_OID_SNMP_UPTIME),
+            snmp_get(_NETGEAR_MEM_FREE),
+            snmp_get(_NETGEAR_MEM_TOTAL),
+            snmp_get(_NETGEAR_CPU_STR),
+            snmp_walk(_OID_IF_DESCR),
+            snmp_walk(_OID_IF_SPEED),
+            snmp_walk(_OID_IF_IN_OCT),
+            snmp_walk(_OID_IF_OUT_OCT),
+            snmp_walk(_OID_IF_IN_ERR),
+            snmp_walk(_OID_IF_OUT_ERR),
+        )
+
+        metrics: dict = {}
+
+        secs = ticks_to_seconds(uptime_raw)
+        if secs is not None:
+            metrics["uptime_seconds"] = secs
+
+        if free_s and total_s:
+            try:
+                free_kb  = int(free_s)
+                total_kb = int(total_s)
+                used_kb  = max(0, total_kb - free_kb)
+                metrics["memory_total_bytes"] = total_kb * 1024
+                metrics["memory_used_bytes"]  = used_kb  * 1024
+                metrics["memory_percent"]     = round(used_kb / total_kb * 100, 1) if total_kb else 0.0
+            except ValueError:
+                pass
+
+        if cpu_s:
+            m = re.search(r'5\s+Secs\s*\(\s*([\d.]+)\s*%\)', cpu_s)
+            if m:
+                try:
+                    metrics["cpu_percent"] = float(m.group(1))
+                except ValueError:
+                    pass
+
+        build_if_metrics(metrics, descr, speed, in_oct, out_oct, in_err, out_err)
+        return metrics
+
         return {"success": success, "output": "\n".join(lines)}
