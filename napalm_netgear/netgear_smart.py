@@ -30,6 +30,7 @@ CLI notes
 import difflib
 import re
 import socket
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import netaddr
@@ -102,6 +103,13 @@ class NetgearSmartDriver(SwitchDriver):
         self._candidate_config: Optional[str] = None
         self._candidate_mode: Optional[str] = None   # 'merge' or 'replace'
         self._backup_config: Optional[str] = None
+
+        # CLI style detection cache: True = "v7" (Cisco-like, GigabitEthernet/lag
+        # interfaces, "show info"/"show interfaces ... status"), False = legacy
+        # FASTPATH-style (0/1, ch1, "show sysinfo"/"show port all"/"show vlan").
+        self._cli_v7: Optional[bool] = None
+        self._port_count_v7: Optional[int] = None
+        self._version_cache: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Connection management
@@ -188,8 +196,13 @@ class NetgearSmartDriver(SwitchDriver):
         return rf"{re.escape(self.device.base_prompt)}[>#]"
 
     def _conf_prompt(self) -> str:
-        """Matches ``(hostname) (Config)#`` config-mode prompt."""
-        return rf"{re.escape(self.device.base_prompt)}\s*\(Config\)[>#]"
+        """Matches the config-mode prompt.
+
+        Legacy FASTPATH firmware uses ``(hostname) (Config)#``; the "v7"
+        Cisco-like CLI uses ``hostname(config)#`` (lowercase, no space).
+        Match both case-insensitively.
+        """
+        return rf"(?i){re.escape(self.device.base_prompt)}\s*\(config\)[>#]"
 
     def _any_prompt(self) -> str:
         """Matches exec prompt and any config sub-mode prompt."""
@@ -263,7 +276,7 @@ class NetgearSmartDriver(SwitchDriver):
         m = re.search(r"(\d+)\s+day", uptime_str, re.I)
         if m:
             days = int(m.group(1))
-        m = re.search(r"(\d+)\s+hr", uptime_str, re.I)
+        m = re.search(r"(\d+)\s+h(?:ou)?r", uptime_str, re.I)
         if m:
             hours = int(m.group(1))
         m = re.search(r"(\d+)\s+min", uptime_str, re.I)
@@ -273,6 +286,86 @@ class NetgearSmartDriver(SwitchDriver):
         if m:
             seconds = int(m.group(1))
         return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+
+    def _detect_cli_v7(self) -> bool:
+        """Detect whether this switch uses the newer "v7" Cisco-like CLI.
+
+        Newer firmware (e.g. GS110TPv3 7.x) exposes ``GigabitEthernet``/``lag``
+        interfaces and a ``show version`` with a "Firmware Version" field,
+        instead of the legacy FASTPATH-style ``0/1``/``ch1`` interfaces and
+        "Software Version" field.
+        """
+        if self._cli_v7 is None:
+            self._cli_v7 = "firmware version" in self._get_version().lower()
+        return self._cli_v7
+
+    def _get_version(self) -> str:
+        """Return (and cache) the output of ``show version``."""
+        if self._version_cache is None:
+            self._version_cache = self._send_command("show version")
+        return self._version_cache
+
+    def _send_paged_command(
+        self, command: str, max_pages: int = 80, initial_delay: float = 1.0, page_delay: float = 0.3
+    ) -> str:
+        """Send a command and keep pressing space while the device paginates output.
+
+        Newer firmware has no "terminal length 0" / "no pager" equivalent, so
+        ``--More--`` prompts must be drained manually. Uses raw
+        ``write_channel``/``read_channel`` (rather than ``send_command_timing``,
+        whose per-call settle delay makes multi-page output prohibitively slow).
+        """
+        self.device.write_channel(command + "\n")
+        time.sleep(initial_delay)
+        chunk = self.device.read_channel()
+        full = chunk
+        pages = 0
+        while "--More--" in chunk and pages < max_pages:
+            self.device.write_channel(" ")
+            time.sleep(page_delay)
+            chunk = self.device.read_channel()
+            full += chunk
+            pages += 1
+        # Strip ANSI/VT100 escape sequences and pager prompts.
+        full = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", full)
+        full = full.replace("--More--", "")
+        return full
+
+    @staticmethod
+    def _expand_port_list_v7(raw: str) -> List[str]:
+        """Expand a "v7" interface-list token into individual interface names.
+
+        Input examples::
+            "g1-8"            → ["g1", "g2", ..., "g8"]
+            "g9-10,lag1-8"    → ["g9", "g10", "lag1", ..., "lag8"]
+            "---"             → []
+        """
+        raw = raw.strip()
+        if not raw or raw == "---":
+            return []
+        ports: List[str] = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            m = re.match(r"^([a-zA-Z]+)(\d+)-(\d+)$", token)
+            if m:
+                prefix, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+                ports.extend(f"{prefix}{i}" for i in range(start, end + 1))
+            else:
+                ports.append(token)
+        return ports
+
+    @staticmethod
+    def _parse_speed_v7(speed: str) -> float:
+        """Parse a "v7" speed column (e.g. "1000M", "1G", "a-1000M") to Mbps."""
+        m = re.search(r"(\d+)\s*([MG])", speed, re.I)
+        if not m:
+            return 0.0
+        val = float(m.group(1))
+        if m.group(2).upper() == "G":
+            val *= 1000.0
+        return val
 
     # ------------------------------------------------------------------
     # NAPALM getters
@@ -303,8 +396,11 @@ class NetgearSmartDriver(SwitchDriver):
             Hardware Version............................. V1
             Serial Number................................ 1FE2345678
         """
+        if self._detect_cli_v7():
+            return self._get_facts_v7()
+
         sysinfo = self._send_command("show sysinfo")
-        version = self._send_command("show version")
+        version = self._get_version()
 
         hostname = self._parse_key_value(sysinfo, "System Name")
 
@@ -341,6 +437,79 @@ class NetgearSmartDriver(SwitchDriver):
             "interface_list": interface_list,
         }
 
+    def _get_facts_v7(self) -> Dict:
+        """``get_facts()`` implementation for the "v7" Cisco-like CLI.
+
+        Example ``show info`` output::
+
+            System Name      : (Switch)
+            System Location  :
+            System Contact   :
+            MAC Address      : 28:94:01:6D:26:7D
+            Firmware Version : 7.1.1.17
+            System Up Time   : 0 days, 0 hours, 8 mins, 55 secs
+
+        Example ``show version`` output (relevant lines)::
+
+            SW version    7.1.1.17
+            ...
+            SN            7LE4535SA0117
+        """
+        info = self._send_command("show info")
+        version = self._get_version()
+
+        hostname = self._parse_key_value(info, "System Name")
+        os_version = (self._parse_key_value(info, "Firmware Version") or "").split()[0:1]
+        os_version = os_version[0] if os_version else ""
+
+        serial_number = self._parse_key_value(version, "SN")
+
+        uptime_str = self._parse_key_value(info, "System Up Time")
+        uptime = self._parse_uptime_seconds(uptime_str)
+
+        # No reliable "model" field is exposed once a custom hostname is set;
+        # the CLI prompt defaults to the model name (e.g. "GS110TPv3") on
+        # switches that have never had their System Name configured.
+        model = self.device.base_prompt or ""
+
+        interface_list = self._get_interface_list_v7()
+
+        return {
+            "vendor": self.VENDOR,
+            "model": model,
+            "hostname": hostname,
+            "fqdn": hostname,
+            "os_version": os_version,
+            "serial_number": serial_number,
+            "uptime": uptime,
+            "interface_list": interface_list,
+        }
+
+    def _get_port_count_v7(self) -> int:
+        """Return the number of GigabitEthernet ports via "show interfaces
+        GigabitEthernet ?", e.g. "<1-10>  GigabitEthernet interface number"."""
+        if self._port_count_v7 is None:
+            output = self.device.send_command_timing(
+                "show interfaces GigabitEthernet ?", strip_prompt=False, strip_command=False
+            )
+            m = re.search(r"<1-(\d+)>", output)
+            self._port_count_v7 = int(m.group(1)) if m else 0
+        return self._port_count_v7
+
+    def _get_interface_list_v7(self) -> List[str]:
+        n = self._get_port_count_v7()
+        interfaces = [f"g{i}" for i in range(1, n + 1)]
+        try:
+            lag_out = self._send_command("show lag")
+        except Exception:
+            lag_out = ""
+        for line in lag_out.splitlines():
+            line_s = line.strip()
+            m = re.match(r"^(\d+)\s*\|\s*([^|]+)\|", line_s)
+            if m and m.group(2).strip() != "------":
+                interfaces.append(f"lag{m.group(1)}")
+        return interfaces
+
     def _get_interface_list(self) -> List[str]:
         """Return sorted list of slot/port interface names from ``show port all``."""
         output = self._send_command("show port all")
@@ -375,6 +544,9 @@ class NetgearSmartDriver(SwitchDriver):
             Description.............................. uplink
             MTU...................................... 1518
         """
+        if self._detect_cli_v7():
+            return self._get_interfaces_v7()
+
         port_out = self._send_command("show port all")
         intf_out = self._send_command("show interface all")
         interfaces = self._parse_interfaces(port_out, intf_out)
@@ -415,6 +587,101 @@ class NetgearSmartDriver(SwitchDriver):
             if lag in interfaces:
                 interfaces[lag]["lag_members"] = members
                 interfaces[lag]["lag_mode"] = lag_mode
+
+    def _get_interfaces_v7(self) -> Dict[str, Dict]:
+        """``get_interfaces()`` implementation for the "v7" Cisco-like CLI.
+
+        Example ``show interfaces GigabitEthernet 1-10 status`` output::
+
+            Port    Name      Status      Vlan    Duplex   Speed   Type
+            ------  --------  ----------  ------  -------  ------  -----
+            g1      uplink    Connected   1       Full     1000M   Copper
+            g2                Notconnct   1       --       --      Copper
+        """
+        n = self._get_port_count_v7()
+        interfaces: Dict[str, Dict] = {}
+        if n:
+            status_out = self._send_command(
+                f"show interfaces GigabitEthernet 1-{n} status"
+            )
+            interfaces.update(self._parse_interface_status_v7(status_out))
+
+        self._add_lag_info_v7(interfaces)
+        return interfaces
+
+    @staticmethod
+    def _parse_interface_status_v7(output: str) -> Dict[str, Dict]:
+        interfaces: Dict[str, Dict] = {}
+        for line in output.splitlines():
+            line_s = line.rstrip()
+            if not line_s:
+                continue
+            stripped = line_s.strip()
+            if stripped.lower().startswith("port") or re.match(r"^-+", stripped):
+                continue
+            fields = re.split(r"\s{2,}", stripped)
+            if len(fields) == 7:
+                port, name, status, _vlan, _duplex, speed, _type = fields
+            elif len(fields) == 6:
+                port, status, _vlan, _duplex, speed, _type = fields
+                name = ""
+            else:
+                continue
+            if not re.match(r"^(g\d+|lag\d+)$", port, re.I):
+                continue
+            status_l = status.lower()
+            interfaces[port] = {
+                "is_up": status_l == "connected",
+                "is_enabled": status_l != "disabled",
+                "description": name,
+                "last_flapped": -1.0,
+                "speed": NetgearSmartDriver._parse_speed_v7(speed),
+                "mtu": 1500,
+                "mac_address": "",
+            }
+        return interfaces
+
+    def _add_lag_info_v7(self, interfaces: Dict[str, Dict]) -> None:
+        """Enrich ``interfaces`` with LAG membership from "show lag".
+
+        Example output::
+
+             | Group   |
+            Index | Type   | Ports
+            ------+--------+-----------------
+            1     | LACP   | g9, g10
+            2     | ------ |
+        """
+        try:
+            output = self._send_command("show lag")
+        except Exception:
+            return
+
+        for line in output.splitlines():
+            line_s = line.strip()
+            m = re.match(r"^(\d+)\s*\|\s*([^|]+)\|\s*(.*)$", line_s)
+            if not m:
+                continue
+            group_id, type_s, ports_s = m.group(1), m.group(2).strip(), m.group(3).strip()
+            if type_s == "------" or not ports_s:
+                continue
+            lag_name = f"lag{group_id}"
+            members = self._expand_port_list_v7(ports_s)
+            member_ifaces = [interfaces[m] for m in members if m in interfaces]
+            for member in members:
+                if member in interfaces:
+                    interfaces[member]["trunk_group"] = lag_name
+            interfaces[lag_name] = {
+                "is_up": any(i["is_up"] for i in member_ifaces),
+                "is_enabled": True,
+                "description": "",
+                "last_flapped": -1.0,
+                "speed": sum(i["speed"] for i in member_ifaces),
+                "mtu": 1500,
+                "mac_address": "",
+                "lag_members": members,
+                "lag_mode": "lacp" if "lacp" in type_s.lower() else "trunk",
+            }
 
     def _parse_interfaces(
         self, port_output: str, intf_output: str = ""
@@ -639,6 +906,9 @@ class NetgearSmartDriver(SwitchDriver):
             1        00:11:22:33:44:55   Dynamic     0/1
             1        ff:ff:ff:ff:ff:ff   Management  CPU
         """
+        if self._detect_cli_v7():
+            return self._get_mac_address_table_v7()
+
         output = self._send_command("show mac-addr-table")
         mac_table = []
         in_table = False
@@ -677,6 +947,53 @@ class NetgearSmartDriver(SwitchDriver):
                     "interface": interface,
                     "vlan": vlan,
                     "static": entry_type in ("static", "management"),
+                    "active": True,
+                    "moves": None,
+                    "last_move": None,
+                }
+            )
+
+        return mac_table
+
+    def _get_mac_address_table_v7(self) -> List[Dict]:
+        """``get_mac_address_table()`` implementation for the "v7" Cisco-like CLI.
+
+        Example ``show mac address-table`` output::
+
+             VID  | MAC Address       | Type       | Ports
+            ------+-------------------+------------+-------
+               1  | 28:94:01:6D:26:7D | Management | CPU
+               1  | 00:1A:8C:87:4E:C6 | Dynamic     | g1
+        """
+        output = self._send_paged_command("show mac address-table")
+        mac_table = []
+
+        for line in output.splitlines():
+            line_s = line.strip()
+            if not line_s or "|" not in line_s:
+                continue
+            if re.match(r"^-+\+", line_s):
+                continue
+
+            parts = [p.strip() for p in line_s.split("|")]
+            if len(parts) < 4:
+                continue
+
+            vid_s, mac_raw, entry_type, interface = parts[0], parts[1], parts[2], parts[3]
+            if not vid_s.isdigit():
+                continue
+
+            try:
+                mac_addr = napalm_helpers.mac(mac_raw)
+            except Exception:
+                mac_addr = mac_raw
+
+            mac_table.append(
+                {
+                    "mac": mac_addr,
+                    "interface": interface,
+                    "vlan": int(vid_s),
+                    "static": entry_type.lower() in ("static", "management"),
                     "active": True,
                     "moves": None,
                     "last_move": None,
@@ -823,6 +1140,9 @@ class NetgearSmartDriver(SwitchDriver):
             1        Default         Default     0/1-0/8
             10       Management      Static      0/1, 0/3
         """
+        if self._detect_cli_v7():
+            return self._get_vlans_v7()
+
         output = self._send_command("show vlan")
         vlans: Dict[str, Dict] = {}
         current_id: Optional[str] = None
@@ -875,6 +1195,39 @@ class NetgearSmartDriver(SwitchDriver):
             elif re.match(r"^\d+/\d+$", token):
                 interfaces.append(token)
         return interfaces
+
+    def _get_vlans_v7(self) -> Dict[str, Dict]:
+        """``get_vlans()`` implementation for the "v7" Cisco-like CLI.
+
+        Example ``show vlan 1-4094`` output::
+
+            VLAN  Name           Type     Untagged Ports     Tagged Ports
+            ----  -------------- -------- ------------------ ------------------
+            1     default        Default  g1-8,lag1-8        ---
+            10    MGMT           Static   ---                g1-8
+        """
+        output = self._send_paged_command("show vlan 1-4094")
+        vlans: Dict[str, Dict] = {}
+        for line in output.splitlines():
+            line_s = line.strip()
+            if not line_s or "|" not in line_s:
+                continue
+            if line_s.upper().startswith("VID") or line_s.upper().startswith("VLAN"):
+                continue
+            if re.match(r"^-+\+", line_s):
+                continue
+            parts = [p.strip() for p in line_s.split("|")]
+            if len(parts) < 4:
+                continue
+            vid_s, name, untagged, tagged = parts[0], parts[1], parts[2], parts[3]
+            if not vid_s.isdigit():
+                continue
+            vlans[vid_s] = {
+                "name": name,
+                "untagged": self._expand_port_list_v7(untagged),
+                "tagged": self._expand_port_list_v7(tagged),
+            }
+        return vlans
 
     # ------------------------------------------------------------------
     # NAPALM configuration management
@@ -1516,6 +1869,19 @@ class NetgearSmartDriver(SwitchDriver):
 
     def _action_fix_snmp(self) -> Dict:
         """Enable SNMP with community 'public' (read-only) on the Netgear Smart switch."""
+        if self._detect_cli_v7():
+            # The "v7" Cisco-like CLI (e.g. GS110TPv3 7.x) has no
+            # "snmp-server"/"show snmp" commands at all — SNMP can only be
+            # enabled via the web UI on this firmware generation.
+            return {
+                "success": False,
+                "output": (
+                    "SNMP cannot be configured via CLI on this switch's firmware "
+                    "(no 'snmp-server' commands available). Enable SNMP manually "
+                    "via the switch's web UI, or ignore this warning."
+                ),
+            }
+
         lines: list = []
 
         self._enter_config_mode()
@@ -1537,6 +1903,8 @@ class NetgearSmartDriver(SwitchDriver):
             lines.append("[ok] SNMP active with community 'public'.")
         else:
             lines.append(f"[warn] Verification failed: {out[:100]}")
+
+        return {"success": success, "output": "\n".join(lines)}
 
     # ------------------------------------------------------------------
     # PoE
