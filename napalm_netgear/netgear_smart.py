@@ -56,6 +56,11 @@ class NetgearSmartDriver(SwitchDriver):
     # Netmiko device type – handles prompt ``(hostname) >`` / ``(hostname) #``
     NETMIKO_DEVICE_TYPE = "netgear_prosafe"
 
+    # PoE priority mapping between the CLI's "low/high/critical" and the
+    # generic priority strings used across drivers.
+    _POE_PRIORITY_MAP = {"low": "PPP_LOW", "high": "PPP_HIGH", "critical": "PPP_CRITICAL"}
+    _POE_PRIORITY_MAP_REV = {v: k for k, v in _POE_PRIORITY_MAP.items()}
+
     def __init__(
         self,
         hostname: str,
@@ -372,7 +377,44 @@ class NetgearSmartDriver(SwitchDriver):
         """
         port_out = self._send_command("show port all")
         intf_out = self._send_command("show interface all")
-        return self._parse_interfaces(port_out, intf_out)
+        interfaces = self._parse_interfaces(port_out, intf_out)
+        self._add_lag_info(interfaces)
+        return interfaces
+
+    def _add_lag_info(self, interfaces: Dict[str, Dict]) -> None:
+        """Enrich ``interfaces`` with LAG/trunk membership from ``show port-channel all``.
+
+        FASTPATH-based switches (NETGEAR M4xxx / GSxxxTxx Smart Managed Pro)
+        expose configured link-aggregation groups via ``show port-channel
+        all``, one row per group (``ch1``, ``ch2``, ...) listing its member
+        ports and a Type column ("Static" or "Dynamic" for LACP). Column
+        layout varies by firmware, so this parses tolerantly: the first
+        token of a matching row is the LAG name, member ports are any
+        ``slot/port`` tokens on the line, and the mode is derived from the
+        presence of "static"/"dynamic" anywhere in the row.
+        """
+        try:
+            output = self._send_command("show port-channel all")
+        except Exception:
+            return
+
+        for line in output.splitlines():
+            parts = line.split()
+            if not parts or not re.match(r"^ch\d+$", parts[0], re.I):
+                continue
+            lag = parts[0]
+            members = re.findall(r"\d+/\d+", line)
+            if not members:
+                continue
+            lag_mode = "lacp"
+            if re.search(r"\bstatic\b", line, re.I):
+                lag_mode = "trunk"
+            for member in members:
+                if member in interfaces:
+                    interfaces[member]["trunk_group"] = lag
+            if lag in interfaces:
+                interfaces[lag]["lag_members"] = members
+                interfaces[lag]["lag_mode"] = lag_mode
 
     def _parse_interfaces(
         self, port_output: str, intf_output: str = ""
@@ -1495,6 +1537,135 @@ class NetgearSmartDriver(SwitchDriver):
             lines.append("[ok] SNMP active with community 'public'.")
         else:
             lines.append(f"[warn] Verification failed: {out[:100]}")
+
+    # ------------------------------------------------------------------
+    # PoE
+    # ------------------------------------------------------------------
+
+    def get_poe_status(self) -> Dict[str, Dict]:
+        """Return PoE configuration per port from ``show power inline``.
+
+        Example output::
+
+            Power management mode: Port limit mode
+            ...
+            Port State Status     Priority Class   Power Up    Max.Power (Admin)
+                                                               (mW)
+            ---- ----- ---------- -------- ------- ----------- -----------------
+            g1   Auto  on         low      class4  802.3at     4700  (30000)
+            g7   Never off        low      N/A     802.3at     0     (30000)
+        """
+        output = self._send_command("show power inline")
+
+        allocation_method = "PPAM_USAGE"
+        mode_m = re.search(r"Power management mode:\s*(.+)", output, re.I)
+        if mode_m:
+            mode = mode_m.group(1).strip().lower()
+            if "port limit" in mode:
+                allocation_method = "PPAM_VALUE"
+            elif "class" in mode:
+                allocation_method = "PPAM_CLASS"
+
+        result: Dict[str, Dict] = {}
+        in_table = False
+        for line in output.splitlines():
+            line_s = line.strip()
+            if re.match(r"^-{4,}", line_s):
+                in_table = True
+                continue
+            if not in_table or not line_s:
+                continue
+            parts = line_s.split()
+            if len(parts) < 4 or not re.match(r"^(g\d+|\d+/\d+|ch\d+)$", parts[0], re.I):
+                continue
+            port, state, _status, priority = parts[0], parts[1], parts[2], parts[3]
+
+            max_power_mw = 0.0
+            m = re.search(r"\((\d+)\)\s*$", line_s)
+            if m:
+                max_power_mw = float(m.group(1))
+
+            result[port] = {
+                "port_id": port,
+                "is_poe_enabled": state.lower() == "auto",
+                "poe_priority": self._POE_PRIORITY_MAP.get(priority.lower(), "PPP_LOW"),
+                "poe_allocation_method": allocation_method,
+                "allocated_power_in_watts": max_power_mw / 1000.0,
+                "pre_standard_detect_enabled": False,
+            }
+
+        return result
+
+    def set_poe(self, interface: str, config: Dict) -> None:
+        """Update PoE configuration for a single port.
+
+        Uses the ``power inline`` interface sub-commands (ProSafe CLI).
+        """
+        lines = [f"interface {interface}"]
+        if "is_poe_enabled" in config:
+            lines.append("power inline auto" if config["is_poe_enabled"] else "power inline never")
+        if "poe_priority" in config:
+            priority = self._POE_PRIORITY_MAP_REV.get(config["poe_priority"], "low")
+            lines.append(f"power inline priority {priority}")
+        if "allocated_power_in_watts" in config and config.get("poe_allocation_method") == "PPAM_VALUE":
+            limit_mw = int(round(float(config["allocated_power_in_watts"]) * 1000))
+            lines.append(f"power inline limit {limit_mw}")
+        lines.append("exit")
+
+        if len(lines) <= 2:
+            return
+
+        self._enter_config_mode()
+        try:
+            errors = self._apply_config_lines("\n".join(lines))
+            if errors:
+                raise CommandErrorException(f"set_poe({interface}) errors: {errors}")
+        finally:
+            self._exit_config_mode()
+        self._save_config()
+
+    # ------------------------------------------------------------------
+    # LAG / trunk membership
+    # ------------------------------------------------------------------
+
+    def set_lag_members(self, lag_name: str, members: List[str]) -> None:
+        """Set the full member-port list of a LAG/trunk group (e.g. ``"ch1"``).
+
+        Diffs ``members`` against the LAG's current members (as reported by
+        ``get_interfaces()``) and issues ``addport``/``deleteport`` interface
+        sub-commands for the difference. FASTPATH-based switches (NETGEAR
+        M4xxx / GSxxxTxx Smart Managed Pro) configure LAG membership
+        per-port via ``interface <port>`` / ``addport <lag>`` / ``deleteport
+        <lag>``.
+        """
+        current = self.get_interfaces().get(lag_name, {})
+        current_members = set(current.get("lag_members") or [])
+        desired = set(members)
+        sort_key = lambda s: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)]  # noqa: E731
+        to_remove = sorted(current_members - desired, key=sort_key)
+        to_add = sorted(desired - current_members, key=sort_key)
+
+        if not to_remove and not to_add:
+            return
+
+        lines: List[str] = []
+        for port in to_remove:
+            lines.append(f"interface {port}")
+            lines.append(f"deleteport {lag_name}")
+            lines.append("exit")
+        for port in to_add:
+            lines.append(f"interface {port}")
+            lines.append(f"addport {lag_name}")
+            lines.append("exit")
+
+        self._enter_config_mode()
+        try:
+            errors = self._apply_config_lines("\n".join(lines))
+            if errors:
+                raise CommandErrorException(f"set_lag_members({lag_name}) errors: {errors}")
+        finally:
+            self._exit_config_mode()
+        self._save_config()
 
     # ------------------------------------------------------------------
     # Health metrics (SNMP)
